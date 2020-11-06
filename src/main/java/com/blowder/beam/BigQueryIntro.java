@@ -11,16 +11,42 @@ import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.schemas.JavaBeanSchema;
 import org.apache.beam.sdk.schemas.annotations.DefaultSchema;
 import org.apache.beam.sdk.schemas.annotations.SchemaCreate;
-import org.apache.beam.sdk.transforms.MapElements;
-import org.apache.beam.sdk.transforms.SimpleFunction;
+import org.apache.beam.sdk.transforms.*;
+import org.apache.beam.sdk.transforms.join.CoGbkResult;
+import org.apache.beam.sdk.transforms.join.CoGroupByKey;
+import org.apache.beam.sdk.transforms.join.KeyedPCollectionTuple;
+import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.commons.lang3.math.NumberUtils;
 
-import java.lang.reflect.Field;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Objects;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 
 public class BigQueryIntro {
+    final static DateTimeFormatter BQ_DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+
+    private static final SimpleFunction<KV<String, Double>, String> toCsvRow = new SimpleFunction<KV<String, Double>, String>() {
+        @Override
+        public String apply(KV<String, Double> input) {
+            return input.getKey() + ";" + input.getValue();
+        }
+    };
+
+    private static final SimpleFunction<MyData, KV<String, Integer>> toMeanByRegionCode = new SimpleFunction<MyData, KV<String, Integer>>() {
+        @Override
+        public KV<String, Integer> apply(MyData input) {
+            return KV.of(input.getLocation(), NumberUtils.toInt(input.getConfirmed(), 0));
+        }
+    };
+    private static final SimpleFunction<MyData, KV<String, String>> toRegionNameByRegionCode = new SimpleFunction<MyData, KV<String, String>>() {
+        @Override
+        public KV<String, String> apply(MyData input) {
+            return KV.of(input.getLocation(), input.getSubregionName() == null ? "" : input.getSubregionName());
+        }
+    };
 
     public interface MyOptions extends PipelineOptions {
         @Description("Path of the file to write to")
@@ -33,25 +59,39 @@ public class BigQueryIntro {
         MyOptions opts = PipelineOptionsFactory.fromArgs(args).as(MyOptions.class);
         Pipeline pipeline = Pipeline.create(opts);
 
-        final String query = "SELECT * FROM bigquery-public-data.covid19_open_data_eu.covid19_open_data limit 10";
+        final String query = String.format("SELECT * FROM bigquery-public-data.covid19_open_data_eu.covid19_open_data where " +
+                        "country_code = '%s' and date > '%s' ",
+                "UA",
+                BQ_DATE_FORMATTER.format(LocalDateTime.now().minus(Duration.ofDays(30))));
 
-        final SimpleFunction<MyData, String> mapper = new SimpleFunction<MyData, String>() {
-            @Override
-            public String apply(MyData input) {
-                return input.toCsvRow();
-            }
-        };
+        PCollection<MyData> myDataCollection = pipeline
+                .apply(BigQueryIO.readTableRows().fromQuery(query).usingStandardSql())
+                .apply(MapElements.into(TypeDescriptor.of(MyData.class)).via(MyData::fromTableRow));
 
-        pipeline
-                .apply(
-                        "Read from BigQuery query",
-                        BigQueryIO.readTableRows()
-                                .fromQuery(query)
-                                .usingStandardSql())
-                .apply(
-                        "TableRows to MyData",
-                        MapElements.into(TypeDescriptor.of(MyData.class)).via(MyData::fromTableRow))
-                .apply("MyData to csv row", MapElements.via(mapper))
+        PCollection<KV<String, String>> regionCodeToName = myDataCollection.apply(MapElements.via(toRegionNameByRegionCode))
+                .apply(Distinct.create());
+        PCollection<KV<String, Double>> meanToName = myDataCollection.apply(MapElements.via(toMeanByRegionCode))
+                .apply(Mean.perKey());
+
+        TupleTag<String> regionCodeTag = new TupleTag<>();
+        TupleTag<Double> meanTag = new TupleTag<>();
+
+        KeyedPCollectionTuple.of(regionCodeTag, regionCodeToName)
+                .and(meanTag, meanToName)
+                .apply(CoGroupByKey.create())
+                .apply(ParDo.of(
+                        new DoFn<KV<String, CoGbkResult>, KV<String, Double>>() {
+                            @ProcessElement
+                            public void processElement(ProcessContext c) {
+                                KV<String, CoGbkResult> e = c.element();
+                                for (String regionName : e.getValue().getAll(regionCodeTag)) {
+                                    for (Double mean : e.getValue().getAll(meanTag)) {
+                                        c.output(KV.of(e.getKey() + ":(" + regionName + ")", mean));
+                                    }
+                                }
+                            }
+                        }))
+                .apply("MyData to csv row", MapElements.via(toCsvRow))
                 .apply("WriteData", TextIO.write().to(opts.getOutputFile()));
         pipeline.run().waitUntilFinish();
 
@@ -61,14 +101,17 @@ public class BigQueryIntro {
     static class MyData {
         private String date;
         @Nullable
-        private Integer confirmed;
+        private String confirmed;
         private String location;
+        @Nullable
+        private String subregionName;
 
         @SchemaCreate
-        public MyData(String date, @Nullable Integer confirmed, String location) {
+        public MyData(String date, @Nullable String confirmed, String location, @Nullable String subregionName) {
             this.date = date;
             this.confirmed = confirmed;
             this.location = location;
+            this.subregionName = subregionName;
         }
 
         public String getDate() {
@@ -80,11 +123,11 @@ public class BigQueryIntro {
         }
 
         @Nullable
-        public Integer getConfirmed() {
+        public String getConfirmed() {
             return confirmed;
         }
 
-        public void setConfirmed(@Nullable Integer confirmed) {
+        public void setConfirmed(@Nullable String confirmed) {
             this.confirmed = confirmed;
         }
 
@@ -96,24 +139,43 @@ public class BigQueryIntro {
             this.location = location;
         }
 
-        public static MyData fromTableRow(TableRow tableRow) {
-            String date = (String) tableRow.get("date");
-            Integer confirmed = (Integer) tableRow.get("new_confirmed");
-            String location = (String) tableRow.get("location_key");
-            return new MyData(date, confirmed, location);
+        @Nullable
+        public String getSubregionName() {
+            return subregionName;
         }
 
-        public String toCsvRow() {
-            List<String> fieldValues = new ArrayList<>();
-            for (Field field : this.getClass().getDeclaredFields()) {
-                field.setAccessible(true);
-                try {
-                    fieldValues.add(Objects.toString(field.get(this)));
-                } catch (IllegalAccessException e) {
-                    fieldValues.add("");
-                }
-            }
-            return String.join(", ", fieldValues);
+        public void setSubregionName(@Nullable String subregionName) {
+            this.subregionName = subregionName;
+        }
+
+        public static MyData fromTableRow(TableRow tableRow) {
+            String date = (String) tableRow.get("date");
+            String confirmed = (String) tableRow.get("new_confirmed");
+            String location = (String) tableRow.get("location_key");
+            String subregionName = (String) tableRow.get("subregion1_name");
+            return new MyData(date, confirmed, location, subregionName);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+
+            MyData myData = (MyData) o;
+
+            if (date != null ? !date.equals(myData.date) : myData.date != null) return false;
+            if (confirmed != null ? !confirmed.equals(myData.confirmed) : myData.confirmed != null) return false;
+            if (location != null ? !location.equals(myData.location) : myData.location != null) return false;
+            return subregionName != null ? subregionName.equals(myData.subregionName) : myData.subregionName == null;
+        }
+
+        @Override
+        public int hashCode() {
+            int result = date != null ? date.hashCode() : 0;
+            result = 31 * result + (confirmed != null ? confirmed.hashCode() : 0);
+            result = 31 * result + (location != null ? location.hashCode() : 0);
+            result = 31 * result + (subregionName != null ? subregionName.hashCode() : 0);
+            return result;
         }
     }
 }
