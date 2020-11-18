@@ -1,0 +1,7 @@
+syntax = "proto2";
+
+package com.blowder.model;
+
+message NumberWrapper{
+  required int32 number = 1;
+}

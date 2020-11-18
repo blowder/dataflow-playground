@@ -1,0 +1,9 @@
+{
+  "fields": [
+    {
+      "name": "mean",
+      "type": "FLOAT64",
+      "mode": "REQUIRED"
+    }
+  ]
+}
